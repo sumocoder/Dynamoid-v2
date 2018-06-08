@@ -1,14 +1,15 @@
-require "delegate"
-require "time"
-require "securerandom"
-require "active_support"
-require "active_support/core_ext"
+require 'delegate'
+require 'time'
+require 'securerandom'
+require 'active_support'
+require 'active_support/core_ext'
 require 'active_support/json'
-require "active_support/inflector"
-require "active_support/lazy_load_hooks"
-require "active_support/time_with_zone"
-require "active_model"
+require 'active_support/inflector'
+require 'active_support/lazy_load_hooks'
+require 'active_support/time_with_zone'
+require 'active_model'
 
+require 'dynamoid/version'
 require 'dynamoid/errors'
 require 'dynamoid/fields'
 require 'dynamoid/indexes'
@@ -24,12 +25,18 @@ require 'dynamoid/components'
 require 'dynamoid/document'
 require 'dynamoid/adapter'
 
+require 'dynamoid/tasks/database'
+
 require 'dynamoid/middleware/identity_map'
+
+if defined?(Rails)
+  require 'dynamoid/railtie'
+end
 
 module Dynamoid
   extend self
 
-  MAX_ITEM_SIZE = 65_536
+  MAX_ITEM_SIZE = 400_000
 
   def configure
     block_given? ? yield(Dynamoid::Config) : Dynamoid::Config

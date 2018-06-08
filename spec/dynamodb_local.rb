@@ -1,15 +1,10 @@
-class DynamoDBLocal
-  DIST_DIR = 'DynamoDBLocal-2015-01-27'
-
-  def self.start!
-    raise 'DynamoDBLocal requires JAVA_HOME to be set' unless ENV.has_key?('JAVA_HOME')
-
-    Dir.chdir(DIST_DIR) do
-      pid = Kernel.spawn("#{ENV['JAVA_HOME']}/bin/java -Djava.library.path=./DynamoDBLocal_lib -jar DynamoDBLocal.jar -inMemory -delayTransientStatuses")
-      STDERR.puts "Started DynamoDBLocal at pid #{pid}."
+module DynamoDBLocal
+  def self.delete_all_specified_tables!
+    if !Dynamoid.adapter.tables.empty?
+      Dynamoid.adapter.list_tables.each do |table|
+        Dynamoid.adapter.delete_table(table) if table =~ /^#{Dynamoid::Config.namespace}/
+      end
+      Dynamoid.adapter.tables.clear
     end
-  end
-
-  def self.stop!
   end
 end

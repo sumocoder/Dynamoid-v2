@@ -5,23 +5,26 @@ module Dynamoid #:nodoc:
   module Fields
     extend ActiveSupport::Concern
 
+
+    # Types allowed in indexes:
     PERMITTED_KEY_TYPES = [
       :number,
       :integer,
       :string,
-      :datetime
+      :datetime,
+      :serialized
     ]
 
     # Initialize the attributes we know the class has, in addition to our magic attributes: id, created_at, and updated_at.
     included do
-      class_attribute :attributes
+      class_attribute :attributes, instance_accessor: false
       class_attribute :range_key
 
       self.attributes = {}
       field :created_at, :datetime
       field :updated_at, :datetime
 
-      field :id #Default primary key
+      field :id # Default primary key
     end
 
     module ClassMethods
@@ -29,7 +32,7 @@ module Dynamoid #:nodoc:
       # Specify a field for a document.
       #
       # Its type determines how it is coerced when read in and out of the datastore.
-      # You can specify :integer, :number, :set, :array, :datetime, and :serialized,
+      # You can specify :integer, :number, :set, :array, :datetime, :date and :serialized,
       # or specify a class that defines a serialization strategy.
       #
       # If you specify a class for field type, Dynamoid will serialize using
@@ -48,20 +51,30 @@ module Dynamoid #:nodoc:
           Dynamoid.logger.warn("Field type :float, which you declared for '#{name}', is deprecated in favor of :number.")
           type = :number
         end
-        self.attributes = attributes.merge(name => {:type => type}.merge(options))
+        self.attributes = attributes.merge(name => {type: type}.merge(options))
 
-        define_method(named) { read_attribute(named) }
-        define_method("#{named}?") { !read_attribute(named).nil? }
-        define_method("#{named}=") {|value| write_attribute(named, value) }
+        generated_methods.module_eval do
+          define_method(named) { read_attribute(named) }
+          define_method("#{named}?") do
+            value = read_attribute(named)
+            case value
+            when true        then true
+            when false, nil  then false
+            else
+              !value.nil?
+            end
+          end
+          define_method("#{named}=") {|value| write_attribute(named, value) }
+        end
       end
 
-      def range(name, type = :string)
-        field(name, type)
+      def range(name, type = :string, options = {})
+        field(name, type, options)
         self.range_key = name
       end
 
       def table(options)
-        #a default 'id' column is created when Dynamoid::Document is included
+        # a default 'id' column is created when Dynamoid::Document is included
         unless(attributes.has_key? hash_key)
           remove_field :id
           field(hash_key)
@@ -70,10 +83,23 @@ module Dynamoid #:nodoc:
 
       def remove_field(field)
         field = field.to_sym
-        attributes.delete(field) or raise "No such field"
-        remove_method field
-        remove_method :"#{field}="
-        remove_method :"#{field}?"
+        attributes.delete(field) or raise 'No such field'
+
+        generated_methods.module_eval do
+          remove_method field
+          remove_method :"#{field}="
+          remove_method :"#{field}?"
+        end
+      end
+
+      private
+
+      def generated_methods
+        @generated_methods ||= begin
+          Module.new.tap do |mod|
+            include(mod)
+          end
+        end
       end
     end
 
@@ -88,10 +114,6 @@ module Dynamoid #:nodoc:
     #
     # @since 0.2.0
     def write_attribute(name, value)
-      if (size = value.to_s.size) > MAX_ITEM_SIZE
-        Dynamoid.logger.warn "DynamoDB can't store items larger than #{MAX_ITEM_SIZE} and the #{name} field has a length of #{size}."
-      end
-
       if association = @associations[name]
         association.reset
       end
@@ -137,14 +159,16 @@ module Dynamoid #:nodoc:
     #
     # @since 0.2.0
     def set_created_at
-      self.created_at = DateTime.now
+      self.created_at ||= DateTime.now.in_time_zone(Time.zone) if Dynamoid::Config.timestamps
     end
 
     # Automatically called during the save callback to set the updated_at time.
     #
     # @since 0.2.0
     def set_updated_at
-      self.updated_at = DateTime.now
+      if Dynamoid::Config.timestamps && !self.updated_at_changed?
+        self.updated_at = DateTime.now.in_time_zone(Time.zone)
+      end
     end
 
     def set_type

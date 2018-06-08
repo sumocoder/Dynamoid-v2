@@ -3,18 +3,78 @@ module Dynamoid
 
     # The AwsSdkV2 adapter provides support for the aws-sdk version 2 for ruby.
     class AwsSdkV2
+      EQ = 'EQ'.freeze
+      RANGE_MAP = {
+          range_greater_than: 'GT',
+          range_less_than:    'LT',
+          range_gte:          'GE',
+          range_lte:          'LE',
+          range_begins_with:  'BEGINS_WITH',
+          range_between:      'BETWEEN',
+          range_eq:           'EQ'
+      }
+
+      # Don't implement NULL and NOT_NULL because it doesn't make seanse -
+      # we declare schema in models
+      FIELD_MAP = {
+          eq:           'EQ',
+          ne:           'NE',
+          gt:           'GT',
+          lt:           'LT',
+          gte:          'GE',
+          lte:          'LE',
+          begins_with:  'BEGINS_WITH',
+          between:      'BETWEEN',
+          in:           'IN',
+          contains:     'CONTAINS',
+          not_contains: 'NOT_CONTAINS'
+      }
+      HASH_KEY  = 'HASH'.freeze
+      RANGE_KEY = 'RANGE'.freeze
+      STRING_TYPE  = 'S'.freeze
+      NUM_TYPE     = 'N'.freeze
+      BINARY_TYPE  = 'B'.freeze
+      TABLE_STATUSES = {
+          creating: 'CREATING',
+          updating: 'UPDATING',
+          deleting: 'DELETING',
+          active: 'ACTIVE'
+      }.freeze
+      PARSE_TABLE_STATUS = ->(resp, lookup = :table) {
+        # lookup is table for describe_table API
+        # lookup is table_description for create_table API
+        #   because Amazon, damnit.
+        resp.send(lookup).table_status
+      }
+      BATCH_WRITE_ITEM_REQUESTS_LIMIT = 25
+
       attr_reader :table_cache
 
       # Establish the connection to DynamoDB.
       #
       # @return [Aws::DynamoDB::Client] the DynamoDB connection
       def connect!
-        @client = if Dynamoid::Config.endpoint?
-          Aws::DynamoDB::Client.new(endpoint: Dynamoid::Config.endpoint)
-        else
-          Aws::DynamoDB::Client.new
-        end
+        @client = Aws::DynamoDB::Client.new(connection_config)
         @table_cache = {}
+      end
+
+      def connection_config
+        @connection_hash = {}
+
+        if Dynamoid::Config.endpoint?
+          @connection_hash[:endpoint] = Dynamoid::Config.endpoint
+        end
+        if Dynamoid::Config.access_key?
+          @connection_hash[:access_key_id] = Dynamoid::Config.access_key
+        end
+        if Dynamoid::Config.secret_key?
+          @connection_hash[:secret_access_key] = Dynamoid::Config.secret_key
+        end
+        if Dynamoid::Config.region?
+          @connection_hash[:region] = Dynamoid::Config.region
+        end
+
+        @connection_hash
       end
 
       # Return the client object.
@@ -24,75 +84,193 @@ module Dynamoid
         @client
       end
 
+      # Puts multiple items in one table
+      #
+      # If optional block is passed it will be called for each written batch of items, meaning once per batch.
+      # Block receives boolean flag which is true if there are some unprocessed items, otherwise false.
+      #
+      # @example Saves several items to the table testtable
+      #   Dynamoid::AdapterPlugin::AwsSdkV2.batch_write_item('table1', [{ id: '1', name: 'a' }, { id: '2', name: 'b'}])
+      #
+      # @example Pass block
+      #   Dynamoid::AdapterPlugin::AwsSdkV2.batch_write_item('table1', items) do |bool|
+      #     if bool
+      #       puts 'there are unprocessed items'
+      #     end
+      #   end
+      #
+      # @param [String] table_name the name of the table
+      # @param [Array]  items to be processed
+      # @param [Hash]   additional options
+      # @param [Proc]   optional block
+      #
+      # See:
+      # * http://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html
+      # * http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#batch_write_item-instance_method
+      def batch_write_item table_name, objects, options = {}
+        items = objects.map { |o| sanitize_item(o) }
+
+        begin
+          while items.present? do
+            batch = items.shift(BATCH_WRITE_ITEM_REQUESTS_LIMIT)
+            requests = batch.map { |item| { put_request: { item: item } } }
+
+            response = client.batch_write_item(
+              {
+                request_items: {
+                  table_name => requests,
+                },
+                return_consumed_capacity: 'TOTAL',
+                return_item_collection_metrics: 'SIZE'
+              }.merge!(options)
+            )
+
+            if block_given?
+              yield(response.unprocessed_items.present?)
+            end
+
+            if response.unprocessed_items.present?
+              items += response.unprocessed_items[table_name].map { |r| r.put_request.item }
+            end
+          end
+        rescue Aws::DynamoDB::Errors::ConditionalCheckFailedException => e
+          raise Dynamoid::Errors::ConditionalCheckFailedException, e
+        end
+      end
+
       # Get many items at once from DynamoDB. More efficient than getting each item individually.
       #
+      # If optional block is passed `nil` will be returned and the block will be called for each read batch of items,
+      # meaning once per batch.
+      #
+      # Block receives parameters:
+      # * hash with items like `{ table_name: [items]}`
+      # * and boolean flag is true if there are some unprocessed keys, otherwise false.
+      #
       # @example Retrieve IDs 1 and 2 from the table testtable
-      #   Dynamoid::Adapter::AwsSdkV2.batch_get_item({'table1' => ['1', '2']})
+      #   Dynamoid::AdapterPlugin::AwsSdkV2.batch_get_item('table1' => ['1', '2'])
+      #
+      # @example Pass block to receive each batch
+      #   Dynamoid::AdapterPlugin::AwsSdkV2.batch_get_item('table1' => ids) do |hash, bool|
+      #     puts hash['table1']
+      #
+      #     if bool
+      #       puts 'there are unprocessed keys'
+      #     end
+      #   end
       #
       # @param [Hash] table_ids the hash of tables and IDs to retrieve
       # @param [Hash] options to be passed to underlying BatchGet call
+      # @param [Proc] optional block can be passed to handle each batch of items
       #
       # @return [Hash] a hash where keys are the table names and the values are the retrieved items
       #
+      #  See:
+      #  * http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#batch_get_item-instance_method
+      #
       # @since 1.0.0
       #
-      # @todo: Provide support for passing options to underlying batch_get_item http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#batch_get_item-instance_method
+      # @todo: Provide support for passing options to underlying batch_get_item
       def batch_get_item(table_ids, options = {})
         request_items = Hash.new{|h, k| h[k] = []}
-        return request_items if table_ids.all?{|k, v| v.empty?}
+        return request_items if table_ids.all?{|k, v| v.blank?}
+
+        ret = Hash.new([].freeze) # Default for tables where no rows are returned
 
         table_ids.each do |t, ids|
-          next if ids.empty?
+          next if ids.blank?
+          ids = Array(ids).dup
           tbl = describe_table(t)
           hk  = tbl.hash_key.to_s
           rng = tbl.range_key.to_s
 
-          keys = if rng.present?
-            Array(ids).map do |h,r|
-              { hk => h, rng => r }
+          while ids.present? do
+            batch = ids.shift(Dynamoid::Config.batch_size)
+
+            request_items = Hash.new{|h, k| h[k] = []}
+
+            keys = if rng.present?
+              Array(batch).map do |h, r|
+                { hk => h, rng => r }
+              end
+            else
+              Array(batch).map do |id|
+                { hk => id }
+              end
             end
-          else
-            Array(ids).map do |id|
-              { hk => id }
+
+            request_items[t] = {
+              keys: keys
+            }
+
+            results = client.batch_get_item(
+              request_items: request_items
+            )
+
+            unless block_given?
+              results.data[:responses].each do |table, rows|
+                ret[table] += rows.collect { |r| result_item_to_hash(r) }
+              end
+            else
+              batch_results = Hash.new([].freeze)
+
+              results.data[:responses].each do |table, rows|
+                batch_results[table] += rows.collect { |r| result_item_to_hash(r) }
+              end
+
+              yield(batch_results, results.unprocessed_keys.present?)
+            end
+
+            if results.unprocessed_keys.present?
+              ids += results.unprocessed_keys[t].keys.map { |h| h[hk] }
             end
           end
-
-          request_items[t] = {
-            keys: keys
-          }
         end
 
-        results = client.batch_get_item(
-          request_items: request_items
-        )
-
-        ret = Hash.new([].freeze) # Default for tables where no rows are returned
-        results.data[:responses].each do |table, rows|
-          ret[table] = rows.collect { |r| result_item_to_hash(r) }
+        unless block_given?
+          ret
         end
-        ret
       end
 
       # Delete many items at once from DynamoDB. More efficient than delete each item individually.
       #
       # @example Delete IDs 1 and 2 from the table testtable
-      #   Dynamoid::Adapter::AwsSdk.batch_delete_item('table1' => ['1', '2'])
-      #or
-      #   Dynamoid::Adapter::AwsSdkV2.batch_delete_item('table1' => [['hk1', 'rk2'], ['hk1', 'rk2']]]))
+      #   Dynamoid::AdapterPlugin::AwsSdk.batch_delete_item('table1' => ['1', '2'])
+      # or
+      #   Dynamoid::AdapterPlugin::AwsSdkV2.batch_delete_item('table1' => [['hk1', 'rk2'], ['hk1', 'rk2']]]))
       #
       # @param [Hash] options the hash of tables and IDs to delete
       #
-      # @return nil
+      # See:
+      # * http://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html
+      # * http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#batch_write_item-instance_method
       #
-      # @todo: Provide support for passing options to underlying delete_item http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#delete_item-instance_method
+      # TODO handle rejections because of internal processing failures
       def batch_delete_item(options)
+        requests = []
+
         options.each_pair do |table_name, ids|
           table = describe_table(table_name)
-          ids.each do |id|
-            client.delete_item(table_name: table_name, key: key_stanza(table, *id))
+
+          ids.each_slice(BATCH_WRITE_ITEM_REQUESTS_LIMIT) do |sliced_ids|
+            delete_requests = sliced_ids.map { |id|
+              {delete_request: {key: key_stanza(table, *id)}}
+            }
+
+            requests << {table_name => delete_requests}
           end
         end
-        nil
+
+        begin
+          requests.map do |request_items|
+            client.batch_write_item(
+              request_items: request_items,
+              return_consumed_capacity: 'TOTAL',
+              return_item_collection_metrics: 'SIZE')
+          end
+        rescue Aws::DynamoDB::Errors::ConditionalCheckFailedException => e
+          raise Dynamoid::Errors::ConditionalCheckFailedException, e
+        end
       end
 
       # Create a table on DynamoDB. This usually takes a long time to complete.
@@ -103,6 +281,7 @@ module Dynamoid
       # @option options [Array<Dynamoid::Indexes::Index>] local_secondary_indexes
       # @option options [Array<Dynamoid::Indexes::Index>] global_secondary_indexes
       # @option options [Symbol] hash_key_type The type of the hash key
+      # @option options [Boolean] sync Wait for table status to be ACTIVE?
       # @since 1.0.0
       def create_table(table_name, key = :id, options = {})
         Dynamoid.logger.info "Creating #{table_name} table. This could take a while."
@@ -117,8 +296,8 @@ module Dynamoid
         gs_indexes = options[:global_secondary_indexes]
 
         key_schema = {
-          :hash_key_schema => { key => (options[:hash_key_type] || :string) },
-          :range_key_schema => options[:range_key]
+          hash_key_schema: { key => (options[:hash_key_type] || :string) },
+          range_key_schema: options[:range_key]
         }
         attribute_definitions = build_all_attribute_definitions(
           key_schema,
@@ -150,9 +329,38 @@ module Dynamoid
             index_to_aws_hash(index)
           end
         end
-        client.create_table(client_opts)
+        resp = client.create_table(client_opts)
+        options[:sync] = true if !options.has_key?(:sync) && ls_indexes.present? || gs_indexes.present?
+        until_past_table_status(table_name, :creating) if options[:sync] &&
+            (status = PARSE_TABLE_STATUS.call(resp, :table_description)) &&
+            status == TABLE_STATUSES[:creating]
+        # Response to original create_table, which, if options[:sync]
+        #   may have an outdated table_description.table_status of "CREATING"
+        resp
       rescue Aws::DynamoDB::Errors::ResourceInUseException => e
         Dynamoid.logger.error "Table #{table_name} cannot be created as it already exists"
+      end
+
+      # Create a table on DynamoDB *synchronously*.
+      # This usually takes a long time to complete.
+      # CreateTable is normally an asynchronous operation.
+      # You can optionally define secondary indexes on the new table,
+      #   as part of the CreateTable operation.
+      # If you want to create multiple tables with secondary indexes on them,
+      #   you must create the tables sequentially.
+      # Only one table with secondary indexes can be
+      #   in the CREATING state at any given time.
+      # See: http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#create_table-instance_method
+      #
+      # @param [String] table_name the name of the table to create
+      # @param [Symbol] key the table's primary key (defaults to :id)
+      # @param [Hash] options provide a range key here if the table has a composite key
+      # @option options [Array<Dynamoid::Indexes::Index>] local_secondary_indexes
+      # @option options [Array<Dynamoid::Indexes::Index>] global_secondary_indexes
+      # @option options [Symbol] hash_key_type The type of the hash key
+      # @since 1.2.0
+      def create_table_synchronously(table_name, key = :id, options = {})
+        create_table(table_name, key, options.merge(sync: true))
       end
 
       # Removes an item from DynamoDB.
@@ -165,6 +373,7 @@ module Dynamoid
       #
       # @todo: Provide support for various options http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#delete_item-instance_method
       def delete_item(table_name, key, options = {})
+        options ||= {}
         range_key = options[:range_key]
         conditions = options[:conditions]
         table = describe_table(table_name)
@@ -180,11 +389,22 @@ module Dynamoid
       # Deletes an entire table from DynamoDB.
       #
       # @param [String] table_name the name of the table to destroy
+      # @option options [Boolean] sync Wait for table status check to raise ResourceNotFoundException
       #
       # @since 1.0.0
-      def delete_table(table_name)
-        client.delete_table(table_name: table_name)
-        table_cache.clear
+      def delete_table(table_name, options = {})
+        resp = client.delete_table(table_name: table_name)
+        until_past_table_status(table_name, :deleting) if options[:sync] &&
+            (status = PARSE_TABLE_STATUS.call(resp, :table_description)) &&
+            status == TABLE_STATUSES[:deleting]
+        table_cache.delete(table_name)
+      rescue Aws::DynamoDB::Errors::ResourceInUseException => e
+        Dynamoid.logger.error "Table #{table_name} cannot be deleted as it is in use"
+        raise e
+      end
+
+      def delete_table_synchronously(table_name, options = {})
+        delete_table(table_name, options.merge(sync: true))
       end
 
       # @todo Add a DescribeTable method.
@@ -201,6 +421,7 @@ module Dynamoid
       #
       # @todo Provide support for various options http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#get_item-instance_method
       def get_item(table_name, key, options = {})
+        options ||= {}
         table    = describe_table(table_name)
         range_key = options.delete(:range_key)
 
@@ -232,7 +453,7 @@ module Dynamoid
             key: key_stanza(table, key, range_key),
             attribute_updates: iu.to_h,
             expected: expected_stanza(conditions),
-            return_values: "ALL_NEW"
+            return_values: 'ALL_NEW'
           )
           result_item_to_hash(result[:attributes])
         rescue Aws::DynamoDB::Errors::ConditionalCheckFailedException => e
@@ -256,19 +477,18 @@ module Dynamoid
       #
       # @since 1.0.0
       #
-      # @todo: Provide support for various options http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#put_item-instance_method
-      def put_item(table_name, object, options = nil)
-        item = {}
-
-        object.each do |k, v|
-          next if v.nil? || (v.respond_to?(:empty?) && v.empty?)
-          item[k.to_s] = v
-        end
+      # See: http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#put_item-instance_method
+      def put_item(table_name, object, options = {})
+        options ||= {}
+        item = sanitize_item(object)
 
         begin
-          client.put_item(table_name: table_name,
-            item: item,
-            expected: expected_stanza(options)
+          client.put_item(
+            {
+              table_name: table_name,
+              item: item,
+              expected: expected_stanza(options)
+            }.merge!(options)
           )
         rescue Aws::DynamoDB::Errors::ConditionalCheckFailedException => e
           raise Dynamoid::Errors::ConditionalCheckFailedException, e
@@ -295,83 +515,99 @@ module Dynamoid
       # @todo Provide support for various other options http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#query-instance_method
       def query(table_name, opts = {})
         table = describe_table(table_name)
-        hk    = (opts[:hash_key].present? ? opts[:hash_key] : table.hash_key).to_s
-        rng   = (opts[:range_key].present? ? opts[:range_key] : table.range_key).to_s
+        hk    = (opts[:hash_key].present? ? opts.delete(:hash_key) : table.hash_key).to_s
+        rng   = (opts[:range_key].present? ? opts.delete(:range_key) : table.range_key).to_s
         q     = opts.slice(
                   :consistent_read,
                   :scan_index_forward,
                   :select,
                   :index_name
                 )
-        limit = opts.delete(:limit)
-        batch = opts.delete(:batch_size)
-        q[:limit] = batch || limit if (batch || limit)
 
         opts.delete(:consistent_read)
         opts.delete(:scan_index_forward)
-        opts.delete(:limit)
         opts.delete(:select)
         opts.delete(:index_name)
 
-        opts.delete(:next_token).tap do |token|
-          break unless token
-          q[:exclusive_start_key] = {
-            hk  => token[:hash_key_element],
-            rng => token[:range_key_element]
-          }
-        end
+        # Deal with various limits and batching
+        record_limit = opts.delete(:record_limit)
+        scan_limit = opts.delete(:scan_limit)
+        batch_size = opts.delete(:batch_size)
+        exclusive_start_key = opts.delete(:exclusive_start_key)
+        limit = [record_limit, scan_limit, batch_size].compact.min
 
         key_conditions = {
           hk => {
-            # TODO: Provide option for other operators like NE, IN, LE, etc
             comparison_operator: EQ,
-            attribute_value_list: [
-              opts.delete(:hash_value).freeze
-            ]
+            attribute_value_list: attribute_value_list(EQ, opts.delete(:hash_value).freeze)
           }
         }
 
         opts.each_pair do |k, v|
-          # TODO: ATM, only few comparison operators are supported, provide support for all operators
           next unless(op = RANGE_MAP[k])
           key_conditions[rng] = {
             comparison_operator: op,
-            attribute_value_list: [
-              opts.delete(k).freeze
-            ].flatten # Flatten as BETWEEN operator specifies array of two elements
+            attribute_value_list: attribute_value_list(op, opts.delete(k).freeze)
           }
         end
 
+        query_filter = {}
+        opts.reject {|k, _| k.in? RANGE_MAP.keys}.each do |attr, hash|
+          query_filter[attr] = {
+            comparison_operator: FIELD_MAP[hash.keys[0]],
+            attribute_value_list: attribute_value_list(FIELD_MAP[hash.keys[0]], hash.values[0].freeze)
+          }
+        end
+
+        q[:limit] = limit if limit
+        q[:exclusive_start_key] = exclusive_start_key if exclusive_start_key
         q[:table_name]     = table_name
         q[:key_conditions] = key_conditions
+        q[:query_filter]   = query_filter
 
         Enumerator.new { |y|
+          record_count = 0
+          scan_count = 0
           loop do
-            result = client.query(q)
+            # Adjust the limit down if the remaining record and/or scan limit are
+            # lower to obey limits. We can assume the difference won't be
+            # negative due to break statements below but choose smaller limit
+            # which is why we have 2 separate if statements.
+            # NOTE: Adjusting based on record_limit can cause many HTTP requests
+            # being made. We may want to change this behavior, but it affects
+            # filtering on data with potentially large gaps.
+            # Example:
+            #    User.where('created_at.gte' => 1.day.ago).record_limit(1000)
+            #    Records 1-999 User's that fit criteria
+            #    Records 1000-2000 Users's that do not fit criteria
+            #    Record 2001 fits criteria
+            # The underlying implementation will have 1 page for records 1-999
+            # then will request with limit 1 for records 1000-2000 (making 1000
+            # requests of limit 1) until hit record 2001.
+            if q[:limit] && record_limit && record_limit - record_count < q[:limit]
+              q[:limit] = record_limit - record_count
+            end
+            if q[:limit] && scan_limit && scan_limit - scan_count < q[:limit]
+              q[:limit] = scan_limit - scan_count
+            end
 
-            result.items.each { |r| y << result_item_to_hash(r) }
-            last_key = result.last_evaluated_key
+            results = client.query(q)
+            results.items.each { |row| y << result_item_to_hash(row) }
 
-            if(last_key && batch)
-              q[:exclusive_start_key] = last_key
+            record_count += results.items.size
+            break if record_limit && record_count >= record_limit
+
+            scan_count += results.scanned_count
+            break if scan_limit && scan_count >= scan_limit
+
+            if(lk = results.last_evaluated_key)
+              q[:exclusive_start_key] = lk
             else
               break
             end
           end
         }
       end
-
-      EQ = "EQ".freeze
-
-      RANGE_MAP = {
-        range_greater_than: 'GT',
-        range_less_than:    'LT',
-        range_gte:          'GE',
-        range_lte:          'LE',
-        range_begins_with:  'BEGINS_WITH',
-        range_between:      'BETWEEN',
-        range_eq:           'EQ'
-      }
 
       # Scan the DynamoDB table. This is usually a very slow operation as it naively filters all data on
       # the DynamoDB servers.
@@ -384,29 +620,65 @@ module Dynamoid
       # @since 1.0.0
       #
       # @todo: Provide support for various options http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#scan-instance_method
-      def scan(table_name, scan_hash, select_opts = {})
-        limit = select_opts.delete(:limit)
-        batch = select_opts.delete(:batch_size)
-
+      def scan(table_name, scan_hash = {}, select_opts = {})
         request = { table_name: table_name }
-        request[:limit] = batch || limit if batch || limit
-        request[:scan_filter] = scan_hash.reduce({}) do |memo, kvp|
-          memo[kvp[0].to_s] = {
-            attribute_value_list: [kvp[1]],
-            # TODO: Provide support for all comparison operators
-            comparison_operator: EQ
-          }
-          memo
-        end if scan_hash.present?
+        request[:consistent_read] = true if select_opts.delete(:consistent_read)
+
+        # Deal with various limits and batching
+        record_limit = select_opts.delete(:record_limit)
+        scan_limit = select_opts.delete(:scan_limit)
+        batch_size = select_opts.delete(:batch_size)
+        exclusive_start_key = select_opts.delete(:exclusive_start_key)
+        request_limit = [record_limit, scan_limit, batch_size].compact.min
+        request[:limit] = request_limit if request_limit
+        request[:exclusive_start_key] = exclusive_start_key if exclusive_start_key
+        
+        if scan_hash.present?
+          request[:scan_filter] = scan_hash.reduce({}) do |memo, (attr, cond)|
+            memo.merge(attr.to_s => {
+              comparison_operator: FIELD_MAP[cond.keys[0]],
+              attribute_value_list: attribute_value_list(FIELD_MAP[cond.keys[0]], cond.values[0].freeze)
+            })
+          end
+        end
 
         Enumerator.new do |y|
-          # Batch loop, pulls multiple requests until done using the start_key
+          record_count = 0
+          scan_count = 0
           loop do
+            # Adjust the limit down if the remaining record and/or scan limit are
+            # lower to obey limits. We can assume the difference won't be
+            # negative due to break statements below but choose smaller limit
+            # which is why we have 2 separate if statements.
+            # NOTE: Adjusting based on record_limit can cause many HTTP requests
+            # being made. We may want to change this behavior, but it affects
+            # filtering on data with potentially large gaps.
+            # Example:
+            #    User.where('created_at.gte' => 1.day.ago).record_limit(1000)
+            #    Records 1-999 User's that fit criteria
+            #    Records 1000-2000 Users's that do not fit criteria
+            #    Record 2001 fits criteria
+            # The underlying implementation will have 1 page for records 1-999
+            # then will request with limit 1 for records 1000-2000 (making 1000
+            # requests of limit 1) until hit record 2001.
+            if request[:limit] && record_limit && record_limit - record_count < request[:limit]
+              request[:limit] = record_limit - record_count
+            end
+            if request[:limit] && scan_limit && scan_limit - scan_count < request[:limit]
+              request[:limit] = scan_limit - scan_count
+            end
+
             results = client.scan(request)
+            results.items.each { |row| y << result_item_to_hash(row) }
 
-            results.data[:items].each { |row| y << result_item_to_hash(row) }
+            record_count += results.items.size
+            break if record_limit && record_count >= record_limit
 
-            if((lk = results[:last_evaluated_key]) && batch)
+            scan_count += results.scanned_count
+            break if scan_limit && scan_count >= scan_limit
+
+            # Keep pulling if we haven't finished paging in all data
+            if(lk = results[:last_evaluated_key])
               request[:exclusive_start_key] = lk
             else
               break
@@ -414,7 +686,6 @@ module Dynamoid
           end
         end
       end
-
 
       #
       # Truncates all records in the given table
@@ -428,7 +699,8 @@ module Dynamoid
         rk    = table.range_key
 
         scan(table_name, {}, {}).each do |attributes|
-          opts = {range_key: attributes[rk.to_sym] } if rk
+          opts = {}
+          opts[:range_key] = attributes[rk.to_sym] if rk
           delete_item(table_name, attributes[hk], opts)
         end
       end
@@ -439,11 +711,49 @@ module Dynamoid
 
       protected
 
-      STRING_TYPE  = "S".freeze
-      NUM_TYPE     = "N".freeze
-      BINARY_TYPE  = "B".freeze
+      def check_table_status?(counter, resp, expect_status)
+        status = PARSE_TABLE_STATUS.call(resp)
+        again = counter < Dynamoid::Config.sync_retry_max_times &&
+                status == TABLE_STATUSES[expect_status]
+        {again: again, status: status, counter: counter}
+      end
 
-      #Converts from symbol to the API string for the given data type
+      def until_past_table_status(table_name, status = :creating)
+        counter = 0
+        resp = nil
+        begin
+          check = {again: true}
+          while check[:again]
+            sleep Dynamoid::Config.sync_retry_wait_seconds
+            resp = client.describe_table(table_name: table_name)
+            check = check_table_status?(counter, resp, status)
+            Dynamoid.logger.info "Checked table status for #{table_name} (check #{check.inspect})"
+            counter += 1
+          end
+        # If you issue a DescribeTable request immediately after a CreateTable
+        #   request, DynamoDB might return a ResourceNotFoundException.
+        # This is because DescribeTable uses an eventually consistent query,
+        #   and the metadata for your table might not be available at that moment.
+        # Wait for a few seconds, and then try the DescribeTable request again.
+        # See: http://docs.aws.amazon.com/sdkforruby/api/Aws/DynamoDB/Client.html#describe_table-instance_method
+        rescue Aws::DynamoDB::Errors::ResourceNotFoundException => e
+          case status
+          when :creating then
+            if counter >= Dynamoid::Config.sync_retry_max_times
+              Dynamoid.logger.warn "Waiting on table metadata for #{table_name} (check #{counter})"
+              retry # start over at first line of begin, does not reset counter
+            else
+              Dynamoid.logger.error "Exhausted max retries (Dynamoid::Config.sync_retry_max_times) waiting on table metadata for #{table_name} (check #{counter})"
+              raise e
+            end
+          else
+            # When deleting a table, "not found" is the goal.
+            Dynamoid.logger.info "Checked table status for #{table_name}: Not Found (check #{check.inspect})"
+          end
+        end
+      end
+
+      # Converts from symbol to the API string for the given data type
       # E.g. :number -> 'N'
       def api_type(type)
         case(type)
@@ -468,21 +778,22 @@ module Dynamoid
       # @return an Expected stanza for the given conditions hash
       #
       def expected_stanza(conditions = nil)
-        expected = Hash.new { |h,k| h[k] = {} }
+        expected = Hash.new { |h, k| h[k] = {} }
         return expected unless conditions
 
-        conditions[:unless_exists].try(:each) do |col|
+        conditions.delete(:unless_exists).try(:each) do |col|
           expected[col.to_s][:exists] = false
         end
-        conditions[:if].try(:each) do |col,val|
+        conditions.delete(:if_exists).try(:each) do |col, val|
+          expected[col.to_s][:exists] = true
+          expected[col.to_s][:value] = val
+        end
+        conditions.delete(:if).try(:each) do |col, val|
           expected[col.to_s][:value] = val
         end
 
         expected
       end
-
-      HASH_KEY  = "HASH".freeze
-      RANGE_KEY = "RANGE".freeze
 
       #
       # New, semi-arbitrary API to get data on the table
@@ -498,7 +809,7 @@ module Dynamoid
       #
       def result_item_to_hash(item)
         {}.tap do |r|
-          item.each { |k,v| r[k.to_sym] = v }
+          item.each { |k, v| r[k.to_sym] = v }
         end
       end
 
@@ -644,9 +955,24 @@ module Dynamoid
         aws_type = api_type(dynamoid_type)
 
         {
-          :attribute_name => name.to_s,
-          :attribute_type => aws_type
+          attribute_name: name.to_s,
+          attribute_type: aws_type
         }
+      end
+
+      # Build an array of values for Condition
+      # Is used in ScanFilter and QueryFilter
+      # https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Condition.html
+      # @params [String] operator: value of RANGE_MAP or FIELD_MAP hash, e.g. "EQ", "LT" etc
+      # @params [Object] value: scalar value or array/set
+      def attribute_value_list(operator, value)
+        # For BETWEEN and IN operators we should keep value as is (it should be already an array)
+        # For all the other operators we wrap the value with array
+        if ["BETWEEN", "IN"].include?(operator)
+          [value].flatten
+        else
+          [value]
+        end
       end
 
       #
@@ -670,7 +996,7 @@ module Dynamoid
         def range_type
           range_type ||= schema[:attribute_definitions].find { |d|
             d[:attribute_name] == range_key
-          }.try(:fetch,:attribute_type, nil)
+          }.try(:fetch, :attribute_type, nil)
         end
 
         def hash_key
@@ -739,19 +1065,19 @@ module Dynamoid
         def to_h
           ret = {}
 
-          @additions.each do |k,v|
+          @additions.each do |k, v|
             ret[k.to_s] = {
               action: ADD,
               value: v
             }
           end
-          @deletions.each do |k,v|
+          @deletions.each do |k, v|
             ret[k.to_s] = {
               action: DELETE,
               value: v
             }
           end
-          @updates.each do |k,v|
+          @updates.each do |k, v|
             ret[k.to_s] = {
               action: PUT,
               value: v
@@ -761,9 +1087,15 @@ module Dynamoid
           ret
         end
 
-        ADD    = "ADD".freeze
-        DELETE = "DELETE".freeze
-        PUT    = "PUT".freeze
+        ADD    = 'ADD'.freeze
+        DELETE = 'DELETE'.freeze
+        PUT    = 'PUT'.freeze
+      end
+
+      def sanitize_item(attributes)
+        attributes.reject do |k, v|
+          v.nil? || ((v.is_a?(Set) || v.is_a?(String)) && v.empty?)
+        end
       end
     end
   end

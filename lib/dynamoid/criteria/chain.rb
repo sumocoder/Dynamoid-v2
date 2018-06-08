@@ -5,9 +5,11 @@ module Dynamoid #:nodoc:
     # The criteria chain is equivalent to an ActiveRecord relation (and realistically I should change the name from
     # chain to relation). It is a chainable object that builds up a query and eventually executes it by a Query or Scan.
     class Chain
+      # TODO: Should we transform any other types of query values?
+      TYPES_TO_DUMP_FOR_QUERY = [:string, :integer, :boolean, :serialized]
       attr_accessor :query, :source, :values, :consistent_read
+      attr_reader :hash_key, :range_key, :index_name
       include Enumerable
-
       # Create a new criteria chain.
       #
       # @param [Class] source the class upon which the ultimate query will be performed.
@@ -16,6 +18,11 @@ module Dynamoid #:nodoc:
         @source = source
         @consistent_read = false
         @scan_index_forward = true
+
+        # Honor STI and :type field if it presents
+        if @source.attributes.key?(:type)
+          @query[:'type.in'] = @source.deep_subclasses.map(&:name) << @source.name
+        end
       end
 
       # The workhorse method of the criteria chain. Each key in the passed in hash will become another criteria that the
@@ -30,7 +37,14 @@ module Dynamoid #:nodoc:
       #
       # @since 0.2.0
       def where(args)
-        args.each {|k, v| query[k.to_sym] = v}
+        args.each do |k, v|
+          sym = k.to_sym
+          query[sym] = if (field_options = source.attributes[sym]) && (type = field_options[:type]) && TYPES_TO_DUMP_FOR_QUERY.include?(type)
+                         source.dump_field(v, field_options)
+                       else
+                         v
+                       end
+        end
         self
       end
 
@@ -46,30 +60,51 @@ module Dynamoid #:nodoc:
         records
       end
 
-      # Destroys all the records matching the criteria.
+      # Returns the last fetched record matched the criteria
+      # Enumerable doesn't implement `last`, only `first`
+      # So we have to implement it ourselves
       #
-      def destroy_all
-        ids = []
-
-        if key_present?
-          ranges = []
-          Dynamoid.adapter.query(source.table_name, range_query).collect do |hash|
-            ids << hash[source.hash_key.to_sym]
-            ranges << hash[source.range_key.to_sym]
-          end
-
-          Dynamoid.adapter.delete(source.table_name, ids,{:range_key => ranges})
-        else
-          Dynamoid.adapter.scan(source.table_name, query, scan_opts).collect do |hash|
-            ids << hash[source.hash_key.to_sym]
-          end
-
-          Dynamoid.adapter.delete(source.table_name, ids)
-        end
+      def last
+        all.to_a.last
       end
 
-      def eval_limit(limit)
-        @eval_limit = limit
+      # Destroys all the records matching the criteria.
+      #
+      def delete_all
+        ids = []
+        ranges = []
+
+        if key_present?
+          Dynamoid.adapter.query(source.table_name, range_query).collect do |hash|
+            ids << hash[source.hash_key.to_sym]
+            ranges << hash[source.range_key.to_sym] if source.range_key
+          end
+
+          Dynamoid.adapter.delete(source.table_name, ids, range_key: ranges.presence)
+        else
+          Dynamoid.adapter.scan(source.table_name, scan_query, scan_opts).collect do |hash|
+            ids << hash[source.hash_key.to_sym]
+            ranges << hash[source.range_key.to_sym] if source.range_key
+          end
+
+          Dynamoid.adapter.delete(source.table_name, ids, range_key: ranges.presence)
+        end
+      end
+      alias_method :destroy_all, :delete_all
+
+      # The record limit is the limit of evaluated records returned by the
+      # query or scan.
+      def record_limit(limit)
+        @record_limit = limit
+        self
+      end
+
+      # The scan limit which is the limit of records that DynamoDB will
+      # internally query or scan. This is different from the record limit
+      # as with filtering DynamoDB may look at N scanned records but return 0
+      # records if none pass the filter.
+      def scan_limit(limit)
+        @scan_limit = limit
         self
       end
 
@@ -95,10 +130,6 @@ module Dynamoid #:nodoc:
         records.each(&block)
       end
 
-      def consistent_opts
-        { :consistent_read => consistent_read }
-      end
-
       private
 
       # The actual records referenced by the association.
@@ -107,12 +138,11 @@ module Dynamoid #:nodoc:
       #
       # @since 0.2.0
       def records
-        results = if key_present?
+        if key_present?
           records_via_query
         else
           records_via_scan
         end
-        @batch_size ? results : Array(results)
       end
 
       def records_via_query
@@ -131,78 +161,212 @@ module Dynamoid #:nodoc:
       def records_via_scan
         if Dynamoid::Config.warn_on_scan
           Dynamoid.logger.warn 'Queries without an index are forced to use scan and are generally much slower than indexed queries!'
-          Dynamoid.logger.warn "You can index this query by adding this to #{source.to_s.downcase}.rb: index [#{source.attributes.sort.collect{|attr| ":#{attr}"}.join(', ')}]"
-        end
-
-        if @consistent_read
-          raise Dynamoid::Errors::InvalidQuery, 'Consistent read is not supported by SCAN operation'
+          Dynamoid.logger.warn "You can index this query by adding index declaration to #{source.to_s.downcase}.rb:"
+          Dynamoid.logger.warn "* global_secondary_index hash_key: 'some-name', range_key: 'some-another-name'"
+          Dynamoid.logger.warn "* local_secondary_indexe range_key: 'some-name'"
+          Dynamoid.logger.warn "Not indexed attributes: #{query.keys.sort.collect{|name| ":#{name}"}.join(', ')}"
         end
 
         Enumerator.new do |yielder|
-          Dynamoid.adapter.scan(source.table_name, query, scan_opts).each do |hash|
+          Dynamoid.adapter.scan(source.table_name, scan_query, scan_opts).each do |hash|
             yielder.yield source.from_database(hash)
           end
         end
       end
 
       def range_hash(key)
-        val = query[key]
+        name, operation = key.to_s.split('.')
+        val = type_cast_condition_parameter(name, query[key])
 
-        return { :range_value => query[key] } if query[key].is_a?(Range)
-
-        case key.to_s.split('.').last
+        case operation
         when 'gt'
-          { :range_greater_than => val.to_f }
+          { range_greater_than: val }
         when 'lt'
-          { :range_less_than  => val.to_f }
+          { range_less_than: val }
         when 'gte'
-          { :range_gte  => val.to_f }
+          { range_gte: val }
         when 'lte'
-          { :range_lte => val.to_f }
+          { range_lte: val }
+        when 'between'
+          { range_between: val }
         when 'begins_with'
-          { :range_begins_with => val }
+          { range_begins_with: val }
         end
+      end
+
+      def field_hash(key)
+        name, operation = key.to_s.split('.')
+        val = type_cast_condition_parameter(name, query[key])
+
+        hash = case operation
+        when 'ne'
+          { ne: val }
+        when 'gt'
+          { gt: val }
+        when 'lt'
+          { lt: val }
+        when 'gte'
+          { gte: val }
+        when 'lte'
+          { lte: val }
+        when 'between'
+          { between: val }
+        when 'begins_with'
+          { begins_with: val }
+        when 'in'
+          { in: val }
+        when 'contains'
+          { contains: val }
+        when 'not_contains'
+          { not_contains: val }
+        end
+
+        return { name.to_sym => hash }
+      end
+
+      def consistent_opts
+        { consistent_read: consistent_read }
       end
 
       def range_query
-        opts = { :hash_value => query[source.hash_key] }
-        if key = query.keys.find { |k| k.to_s.include?('.') }
-          opts.merge!(range_hash(key))
+        opts = {}
+
+        # Add hash key
+        opts[:hash_key] = @hash_key
+        opts[:hash_value] = type_cast_condition_parameter(@hash_key, query[@hash_key])
+
+        # Add range key
+        if @range_key
+          opts[:range_key] = @range_key
+          if query[@range_key].present?
+            value = type_cast_condition_parameter(@range_key, query[@range_key])
+            opts.update(range_eq: value)
+          end
+
+          query.keys.select { |k| k.to_s =~ /^#{@range_key}\./ }.each do |key|
+            opts.merge!(range_hash(key))
+          end
         end
+
+        (query.keys.map(&:to_sym) - [@hash_key.to_sym, @range_key.try(:to_sym)])
+          .reject { |k, _| k.to_s =~ /^#{@range_key}\./ }
+          .each do |key|
+          if key.to_s.include?('.')
+            opts.update(field_hash(key))
+          else
+            value = type_cast_condition_parameter(key, query[key])
+            opts[key] = {eq: value}
+          end
+        end
+
         opts.merge(query_opts).merge(consistent_opts)
       end
 
-      def query_keys
-        query.keys.collect{|k| k.to_s.split('.').first}
+      def type_cast_condition_parameter(key, value)
+        return value if [:array, :set].include?(source.attributes[key.to_sym][:type])
+
+        if !value.respond_to?(:to_ary)
+          source.dump_field(value, source.attributes[key.to_sym])
+        else
+          value.to_ary.map { |el| source.dump_field(el, source.attributes[key.to_sym]) }
+        end
       end
 
-      # [hash_key] or [hash_key, range_key] is specified in query keys.
       def key_present?
-        query_keys == [source.hash_key.to_s] || (query_keys.to_set == [source.hash_key.to_s, source.range_key.to_s].to_set)
+        query_keys = query.keys.collect { |k| k.to_s.split('.').first }
+
+        # See if querying based on table hash key
+        if query.keys.map(&:to_s).include?(source.hash_key.to_s)
+          @hash_key = source.hash_key
+
+          # Use table's default range key
+          if query_keys.include?(source.range_key.to_s)
+            @range_key = source.range_key
+            return true
+          end
+
+          # See if can use any local secondary index range key
+          # Chooses the first LSI found that can be utilized for the query
+          source.local_secondary_indexes.each do |_, lsi|
+            next unless query_keys.include?(lsi.range_key.to_s)
+            @range_key = lsi.range_key
+            @index_name = lsi.name
+          end
+
+          return true
+        end
+
+        # See if can use any global secondary index
+        # Chooses the first GSI found that can be utilized for the query
+        # But only do so if projects ALL attributes otherwise we won't
+        # get back full data
+        source.global_secondary_indexes.each do |_, gsi|
+          next unless query.keys.map(&:to_s).include?(gsi.hash_key.to_s) && gsi.projected_attributes == :all
+          @hash_key = gsi.hash_key
+          @range_key = gsi.range_key
+          @index_name = gsi.name
+          return true
+        end
+
+        # Could not utilize any indices so we'll have to scan
+        false
       end
 
+      # Start key needs to be set up based on the index utilized
+      # If using a secondary index then we must include the index's composite key
+      # as well as the tables composite key.
       def start_key
-        key = { :hash_key_element => @start.hash_key }
-        if range_key = @start.class.range_key
-          key.merge!({:range_key_element => @start.send(range_key) })
+        return @start if @start.is_a?(Hash)
+        hash_key = @hash_key || source.hash_key
+        range_key = @range_key || source.range_key
+
+        key = {}
+        key[hash_key] = type_cast_condition_parameter(hash_key, @start.send(hash_key))
+        if range_key
+          key[range_key] = type_cast_condition_parameter(range_key, @start.send(range_key))
+        end
+        # Add table composite keys if they differ from secondary index used composite key
+        if hash_key != source.hash_key
+          key[source.hash_key] = type_cast_condition_parameter(source.hash_key, @start.hash_key)
+        end
+        if source.range_key && range_key != source.range_key
+          key[source.range_key] = type_cast_condition_parameter(source.range_key, @start.range_value)
         end
         key
       end
 
       def query_opts
         opts = {}
+        opts[:index_name] = @index_name if @index_name
         opts[:select] = 'ALL_ATTRIBUTES'
-        opts[:limit] = @eval_limit if @eval_limit
-        opts[:next_token] = start_key if @start
+        opts[:record_limit] = @record_limit if @record_limit
+        opts[:scan_limit] = @scan_limit if @scan_limit
+        opts[:batch_size] = @batch_size if @batch_size
+        opts[:exclusive_start_key] = start_key if @start
         opts[:scan_index_forward] = @scan_index_forward
         opts
       end
 
+      def scan_query
+        {}.tap do |opts|
+          query.keys.map(&:to_sym).each do |key|
+            if key.to_s.include?('.')
+              opts.update(field_hash(key))
+            else
+              value = type_cast_condition_parameter(key, query[key])
+              opts[key] = {eq: value}
+            end
+          end
+        end
+      end
+
       def scan_opts
         opts = {}
-        opts[:limit] = @eval_limit if @eval_limit
-        opts[:next_token] = start_key if @start
+        opts[:record_limit] = @record_limit if @record_limit
+        opts[:scan_limit] = @scan_limit if @scan_limit
         opts[:batch_size] = @batch_size if @batch_size
+        opts[:exclusive_start_key] = start_key if @start
+        opts[:consistent_read] = true if @consistent_read
         opts
       end
     end

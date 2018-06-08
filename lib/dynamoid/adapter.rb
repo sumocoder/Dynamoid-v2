@@ -17,7 +17,7 @@ module Dynamoid
 
     def tables
       if !@tables_.value
-        @tables_.swap{|value, args| benchmark('Cache Tables') {list_tables}}
+        @tables_.swap{|value, args| benchmark('Cache Tables') { list_tables || [] } }
       end
       @tables_.value
     end
@@ -51,7 +51,7 @@ module Dynamoid
     def benchmark(method, *args)
       start = Time.now
       result = yield
-      Dynamoid.logger.info "(#{((Time.now - start) * 1000.0).round(2)} ms) #{method.to_s.split('_').collect(&:upcase).join(' ')}#{ " - #{args.inspect}" unless args.nil? || args.empty? }"
+      Dynamoid.logger.debug "(#{((Time.now - start) * 1000.0).round(2)} ms) #{method.to_s.split('_').collect(&:upcase).join(' ')}#{ " - #{args.inspect}" unless args.nil? || args.empty? }"
       return result
     end
 
@@ -80,12 +80,12 @@ module Dynamoid
     #                        unless multiple ids are passed in.
     #
     # @since 0.2.0
-    def read(table, ids, options = {})
+    def read(table, ids, options = {}, &blk)
       range_key = options.delete(:range_key)
 
       if ids.respond_to?(:each)
         ids = ids.collect{|id| range_key ? [id, range_key] : id}
-        batch_get_item({table => ids}, options)
+        batch_get_item({table => ids}, options, &blk)
       else
         options[:range_key] = range_key if range_key
         get_item(table, ids, options)
@@ -99,13 +99,13 @@ module Dynamoid
     # @param [Array] range_key of the record to delete, can also be a string of just one range_key
     #
     def delete(table, ids, options = {})
-      range_key = options[:range_key] #array of range keys that matches the ids passed in
+      range_key = options[:range_key] # array of range keys that matches the ids passed in
       if ids.respond_to?(:each)
         if range_key.respond_to?(:each)
-          #turn ids into array of arrays each element being hash_key, range_key
-          ids = ids.each_with_index.map{|id,i| [id,range_key[i]]}
+          # turn ids into array of arrays each element being hash_key, range_key
+          ids = ids.each_with_index.map{|id, i| [id, range_key[i]]}
         else
-          ids = range_key ? [[ids, range_key]] : ids
+          ids = range_key ? ids.map { |id| [id, range_key] } : ids
         end
 
         batch_delete_item(table => ids)
@@ -120,7 +120,7 @@ module Dynamoid
     # @param [Hash] scan_hash a hash of attributes: matching records will be returned by the scan
     #
     # @since 0.2.0
-    def scan(table, query, opts = {})
+    def scan(table, query = {}, opts = {})
       benchmark('Scan', table, query) {adapter.scan(table, query, opts)}
     end
 
@@ -131,12 +131,25 @@ module Dynamoid
       end
     end
 
-    [:batch_get_item, :delete_item, :delete_table, :get_item, :list_tables, :put_item].each do |m|
+    # @since 0.2.0
+    def delete_table(table_name, options = {})
+      if tables.include?(table_name)
+        benchmark('Delete Table') { adapter.delete_table(table_name, options) }
+        idx = tables.index(table_name)
+        tables.delete_at(idx)
+      end
+    end
+
+    [:batch_get_item, :delete_item, :get_item, :list_tables, :put_item, :truncate, :batch_write_item, :batch_delete_item].each do |m|
       # Method delegation with benchmark to the underlying adapter. Faster than relying on method_missing.
       #
       # @since 0.2.0
-      define_method(m) do |*args|
-        benchmark("#{m.to_s}", args) {adapter.send(m, *args)}
+      define_method(m) do |*args, &blk|
+        if blk.present?
+          benchmark("#{m.to_s}", *args) { adapter.send(m, *args, &blk) }
+        else
+          benchmark("#{m.to_s}", *args) { adapter.send(m, *args) }
+        end
       end
     end
 

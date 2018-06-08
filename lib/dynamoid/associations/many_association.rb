@@ -14,7 +14,7 @@ module Dynamoid #:nodoc:
 
       include Enumerable
       # Delegate methods to the records the association represents.
-      delegate :first, :last, :empty?, :size, :class, :to => :records
+      delegate :first, :last, :empty?, :size, :class, to: :records
 
       # The records associated to the source.
       #
@@ -52,11 +52,12 @@ module Dynamoid #:nodoc:
       #
       # @since 0.2.0
       def delete(object)
-        source.update_attribute(source_attribute, source_ids - Array(object).collect(&:id))
-        Array(object).each {|o| self.send(:disassociate_target, o)} if target_association
+        disassociate(Array(object).collect(&:hash_key))
+        if target_association
+          Array(object).each { |obj| obj.send(target_association).disassociate(source.hash_key) }
+        end
         object
       end
-
 
       # Add an object or array of objects to an association. This preserves the current records in the association (if any)
       # and adds the object to the target association if it is detected to exist.
@@ -67,8 +68,12 @@ module Dynamoid #:nodoc:
       #
       # @since 0.2.0
       def <<(object)
-        source.update_attribute(source_attribute, source_ids.merge(Array(object).collect(&:id)))
-        Array(object).each {|o| self.send(:associate_target, o)} if target_association
+        associate(Array(object).collect(&:hash_key))
+
+        if target_association
+          Array(object).each { |obj| obj.send(target_association).associate(source.hash_key) }
+        end
+
         object
       end
 
@@ -145,8 +150,10 @@ module Dynamoid #:nodoc:
       #
       # @since 0.2.0
       def where(args)
-        args.each {|k, v| query[k] = v}
-        self
+        filtered = clone
+        filtered.query = query.clone
+        args.each {|k, v| filtered.query[k] = v}
+        filtered
       end
 
       # Is this array equal to the association's records?
@@ -167,6 +174,14 @@ module Dynamoid #:nodoc:
         else
           super
         end
+      end
+
+      def associate(hash_key)
+        source.update_attribute(source_attribute, source_ids.merge(Array(hash_key)))
+      end
+
+      def disassociate(hash_key)
+        source.update_attribute(source_attribute, source_ids - Array(hash_key))
       end
 
       private

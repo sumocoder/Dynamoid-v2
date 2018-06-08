@@ -1,15 +1,14 @@
 require File.expand_path(File.dirname(__FILE__) + '/../../spec_helper')
 
 describe Dynamoid::Associations::Association do
+  let(:subscription) {Subscription.create}
+  let(:magazine) {Magazine.create}
 
   it 'returns an empty array if there are no associations' do
-    expect(Magazine.create.subscriptions).to be_empty
+    expect(magazine.subscriptions).to be_empty
   end
 
   it 'adds an item to an association' do
-    subscription = Subscription.create
-    magazine = Magazine.create
-
     magazine.subscriptions << subscription
 
     expect(magazine.subscriptions.size).to eq 1
@@ -17,9 +16,6 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'deletes an item from an association' do
-    subscription = Subscription.create
-    magazine = Magazine.create
-
     magazine.subscriptions << subscription
 
     magazine.subscriptions.delete(subscription)
@@ -27,7 +23,6 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'creates an item from an association' do
-    magazine = Magazine.create
     subscription = magazine.subscriptions.create
 
     expect(subscription.class).to eq Subscription
@@ -36,7 +31,6 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'returns the number of items in the association' do
-    magazine = Magazine.create
     magazine.subscriptions.create
     expect(magazine.subscriptions.size).to eq 1
 
@@ -51,16 +45,12 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'assigns directly via the equals operator' do
-    magazine = Magazine.create
-    subscription = Subscription.create
     magazine.subscriptions = [subscription]
 
     expect(magazine.subscriptions).to eq [subscription]
   end
 
   it 'assigns directly via the equals operator and reflects to the target association' do
-    magazine = Magazine.create
-    subscription = Subscription.create
     magazine.subscriptions = [subscription]
 
     expect(subscription.magazine).to eq magazine
@@ -77,7 +67,6 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'deletes all items from the association' do
-    magazine = Magazine.create
     magazine.subscriptions << Subscription.create
     magazine.subscriptions << Subscription.create
     magazine.subscriptions << Subscription.create
@@ -89,7 +78,6 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'uses where inside an association and returns a result' do
-    magazine = Magazine.create
     included_subscription = magazine.subscriptions.create(length: 10)
     unincldued_subscription = magazine.subscriptions.create(length: 8)
 
@@ -97,7 +85,6 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'uses where inside an association and returns an empty set' do
-    magazine = Magazine.create
     included_subscription = magazine.subscriptions.create(length: 10)
     unincldued_subscription = magazine.subscriptions.create(length: 8)
 
@@ -105,22 +92,18 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'includes enumerable' do
-    magazine = Magazine.create
     subscription1 = magazine.subscriptions.create
     subscription2 = magazine.subscriptions.create
     subscription3 = magazine.subscriptions.create
 
-    expect(magazine.subscriptions.collect(&:id).sort).to eq [subscription1.id, subscription2.id, subscription3.id].sort
+    expect(magazine.subscriptions.collect(&:hash_key).sort).to eq [subscription1.hash_key, subscription2.hash_key, subscription3.hash_key].sort
   end
 
   it 'works for camel-cased associations' do
-    expect(Magazine.create.camel_cases.create.class).to eq CamelCase
+    expect(magazine.camel_cases.create.class).to eq CamelCase
   end
 
   it 'destroys associations' do
-    subscription = Subscription.create
-    magazine = Magazine.create
-
     expect(magazine.subscriptions).to receive(:target).and_return([subscription])
     expect(subscription).to receive(:destroy)
 
@@ -128,8 +111,6 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'deletes associations' do
-    subscription = Subscription.new
-    magazine = Magazine.create
     expect(magazine.subscriptions).to receive(:target).and_return([subscription])
     expect(subscription).to receive(:delete)
 
@@ -137,24 +118,22 @@ describe Dynamoid::Associations::Association do
   end
 
   it 'replaces existing associations when using the setter' do
-    magazine = Magazine.create
     subscription1 = magazine.subscriptions.create
     subscription2 = magazine.subscriptions.create
-    subscription3 = Subscription.create
+    subscription3 = subscription
 
     expect(subscription1.reload.magazine_ids).to be_present
     expect(subscription2.reload.magazine_ids).to be_present
 
     magazine.subscriptions = subscription3
-    expect(magazine.subscriptions_ids).to eq Set[subscription3.id]
+    expect(magazine.subscriptions_ids).to eq Set[subscription3.hash_key]
 
     expect(subscription1.reload.magazine_ids).to be_blank
     expect(subscription2.reload.magazine_ids).to be_blank
-    expect(subscription3.reload.magazine_ids).to eq Set[magazine.id]
+    expect(subscription3.reload.magazine_ids).to eq Set[magazine.hash_key]
   end
 
   it 'destroys all objects and removes them from the association' do
-    magazine = Magazine.create
     subscription1 = magazine.subscriptions.create
     subscription2 = magazine.subscriptions.create
     subscription3 = magazine.subscriptions.create
@@ -162,11 +141,10 @@ describe Dynamoid::Associations::Association do
     magazine.subscriptions.destroy_all
 
     expect(magazine.subscriptions).to be_blank
-    expect(Subscription.all).to be_empty
+    expect(Subscription.all.to_a).to be_empty
   end
 
   it 'deletes all objects and removes them from the association' do
-    magazine = Magazine.create
     subscription1 = magazine.subscriptions.create
     subscription2 = magazine.subscriptions.create
     subscription3 = magazine.subscriptions.create
@@ -174,12 +152,10 @@ describe Dynamoid::Associations::Association do
     magazine.subscriptions.delete_all
 
     expect(magazine.subscriptions).to be_blank
-    expect(Subscription.all).to be_empty
+    expect(Subscription.all.to_a).to be_empty
   end
 
   it 'delegates class to the association object' do
-    magazine = Magazine.create
-
     expect(magazine.sponsor.class).to eq nil.class
     magazine.sponsor.create
     expect(magazine.sponsor.class).to eq Sponsor
@@ -191,13 +167,12 @@ describe Dynamoid::Associations::Association do
 
   it 'loads association one time only' do
     pending("FIXME: find_target doesn't exist anymore")
-    magazine = Magazine.create
     sponsor = magazine.sponsor.create
 
     expect(magazine.sponsor).to receive(:find_target).once.and_return(sponsor)
 
-    magazine.sponsor.id
-    magazine.sponsor.id
+    magazine.sponsor.hash_key
+    magazine.sponsor.hash_key
   end
 
 end

@@ -5,18 +5,23 @@ module Dynamoid #:nodoc:
     module SingleAssociation
       include Association
 
-      delegate :class, :to => :target
+      delegate :class, to: :target
 
       def setter(object)
-        delete
-        source.update_attribute(source_attribute, Set[object.id])
-        self.send(:associate_target, object) if target_association
+        if object.nil?
+          delete
+          return
+        end
+
+        associate(object.hash_key)
+        self.target = object
+        object.send(target_association).associate(source.hash_key) if target_association
         object
       end
 
       def delete
-        source.update_attribute(source_attribute, nil)
-        self.send(:disassociate_target, target) if target && target_association
+        target.send(target_association).disassociate(source.hash_key) if target && target_association
+        disassociate
         target
       end
 
@@ -25,9 +30,8 @@ module Dynamoid #:nodoc:
       end
 
       def create(attributes = {})
-        setter(target_class.create!(attributes))
+        setter(target_class.create(attributes))
       end
-
 
       # Is this object equal to the association's target?
       #
@@ -53,6 +57,21 @@ module Dynamoid #:nodoc:
         target.nil?
       end
 
+      def empty?
+        # This is needed to that ActiveSupport's #blank? and #present?
+        # methods work as expected for SingleAssociations.
+        target.nil?
+      end
+
+      def associate(hash_key)
+        target.send(target_association).disassociate(source.hash_key) if target && target_association
+        source.update_attribute(source_attribute, Set[hash_key])
+      end
+
+      def disassociate(hash_key=nil)
+        source.update_attribute(source_attribute, nil)
+      end
+
       private
 
       # Find the target of the has_one association.
@@ -63,6 +82,11 @@ module Dynamoid #:nodoc:
       def find_target
         return if source_ids.empty?
         target_class.find(source_ids.first)
+      end
+
+      def target=(object)
+        @target = object
+        @loaded = true
       end
     end
   end

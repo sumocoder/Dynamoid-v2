@@ -3,8 +3,8 @@ module Dynamoid
     extend ActiveSupport::Concern
 
     included do
-      class_attribute :local_secondary_indexes
-      class_attribute :global_secondary_indexes
+      class_attribute :local_secondary_indexes, instance_accessor: false
+      class_attribute :global_secondary_indexes, instance_accessor: false
       self.local_secondary_indexes = {}
       self.global_secondary_indexes = {}
     end
@@ -39,8 +39,8 @@ module Dynamoid
         end
 
         index_opts = {
-            :read_capacity => Dynamoid::Config.read_capacity,
-            :write_capacity => Dynamoid::Config.write_capacity
+            read_capacity: Dynamoid::Config.read_capacity,
+            write_capacity: Dynamoid::Config.write_capacity
         }.merge(options)
 
         index_opts[:dynamoid_class] = self
@@ -51,7 +51,6 @@ module Dynamoid
         self.global_secondary_indexes[gsi_key] = index
         self
       end
-
 
       # Defines a local secondary index on a table. Will use the same primary
       # hash key as the table.
@@ -83,11 +82,10 @@ module Dynamoid
             ' must use a different :range_key than the primary key')
         end
 
-        index_opts = options.merge({
-          :dynamoid_class => self,
-          :type => :local_secondary,
-          :hash_key => primary_hash_key
-        })
+        index_opts = options.merge(
+          dynamoid_class: self,
+          type: :local_secondary,
+          hash_key: primary_hash_key)
 
         index = Dynamoid::Indexes::Index.new(index_opts)
         key = index_key(primary_hash_key, index_range_key)
@@ -95,12 +93,10 @@ module Dynamoid
         self
       end
 
-
       def find_index(hash, range=nil)
         index = self.indexes[index_key(hash, range)]
         index
       end
-
 
       # Returns true iff the provided hash[,range] key combo is a local
       # secondary index.
@@ -113,7 +109,6 @@ module Dynamoid
         self.local_secondary_indexes[index_key(hash, range)].present?
       end
 
-
       # Returns true iff the provided hash[,range] key combo is a global
       # secondary index.
       #
@@ -124,7 +119,6 @@ module Dynamoid
       def is_global_secondary_index?(hash, range=nil)
         self.global_secondary_indexes[index_key(hash, range)].present?
       end
-
 
       # Generates a convenient lookup key name for a hash/range index.
       # Should normally not be used directly.
@@ -140,7 +134,6 @@ module Dynamoid
         name
       end
 
-
       # Generates a default index name.
       #
       # @param [Symbol] hash hash key name.
@@ -149,7 +142,6 @@ module Dynamoid
       def index_name(hash, range=nil)
         "#{self.table_name}_index_#{self.index_key(hash, range)}"
       end
-
 
       # Convenience method to return all indexes on the table.
       #
@@ -165,7 +157,6 @@ module Dynamoid
         end
       end
     end
-
 
     # Represents the attributes of a DynamoDB index.
     class Index
@@ -186,7 +177,6 @@ module Dynamoid
         validate_projected_attributes
       end
 
-
       def initialize(attrs={})
         unless attrs[:dynamoid_class].present?
           raise Dynamoid::Errors::InvalidIndex.new(':dynamoid_class is required')
@@ -205,7 +195,6 @@ module Dynamoid
         raise Dynamoid::Errors::InvalidIndex.new(self) unless self.valid?
       end
 
-
       # Convenience method to determine the projection type for an index.
       # Projection types are: :keys_only, :all, :include.
       #
@@ -218,19 +207,16 @@ module Dynamoid
         end
       end
 
-
       private
 
         def validate_projected_attributes
-          unless (@projected_attributes.is_a?(Array) ||
-                  PROJECTION_TYPES.include?(@projected_attributes))
+          unless @projected_attributes.is_a?(Array) || PROJECTION_TYPES.include?(@projected_attributes)
             errors.add(:projected_attributes, 'Invalid projected attributes specified.')
           end
         end
 
         def validate_index_type
-          unless (@type.present? &&
-            [:local_secondary, :global_secondary].include?(@type))
+          unless @type.present? && [:local_secondary, :global_secondary].include?(@type)
               errors.add(:type, 'Invalid index :type specified')
           end
         end

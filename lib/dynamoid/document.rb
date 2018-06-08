@@ -8,12 +8,12 @@ module Dynamoid #:nodoc:
     include Dynamoid::Components
 
     included do
-      class_attribute :options, :read_only_attributes, :base_class
+      class_attribute :options, :read_only_attributes, :base_class, instance_accessor: false
       self.options = {}
       self.read_only_attributes = []
       self.base_class = self
 
-      Dynamoid.included_models << self
+      Dynamoid.included_models << self unless Dynamoid.included_models.include? self
     end
 
     module ClassMethods
@@ -72,7 +72,11 @@ module Dynamoid #:nodoc:
       #
       # @since 0.2.0
       def create(attrs = {})
-        attrs[:type] ? attrs[:type].constantize.new(attrs).tap(&:save) : new(attrs).tap(&:save)
+        if attrs.is_a?(Array)
+          attrs.map { |attr| create(attr) }
+        else
+          build(attrs).tap(&:save)
+        end
       end
 
       # Initialize a new object and immediately save it to the database. Raise an exception if persistence failed.
@@ -83,7 +87,11 @@ module Dynamoid #:nodoc:
       #
       # @since 0.2.0
       def create!(attrs = {})
-        attrs[:type] ? attrs[:type].constantize.new(attrs).tap(&:save!) : new(attrs).tap(&:save!)
+        if attrs.is_a?(Array)
+          attrs.map { |attr| create!(attr) }
+        else
+          build(attrs).tap(&:save!)
+        end
       end
 
       # Initialize a new object.
@@ -106,9 +114,84 @@ module Dynamoid #:nodoc:
       # @since 0.2.0
       def exists?(id_or_conditions = {})
         case id_or_conditions
-          when Hash then ! where(id_or_conditions).all.empty?
-          else !! find(id_or_conditions)
+          when Hash then where(id_or_conditions).first.present?
+          else !! find_by_id(id_or_conditions)
         end
+      end
+
+      def update(hash_key, range_key_value=nil, attrs)
+        if range_key.present?
+          range_key_value = dump_field(range_key_value, attributes[self.range_key])
+        else
+          range_key_value = nil
+        end
+
+        model = find(hash_key, range_key: range_key_value, consistent_read: true)
+        model.update_attributes(attrs)
+        model
+      end
+
+      def update_fields(hash_key_value, range_key_value=nil, attrs={}, conditions={})
+        optional_params = [range_key_value, attrs, conditions].compact
+        if optional_params.first.is_a?(Hash)
+          range_key_value = nil
+          attrs, conditions = optional_params[0 .. 1]
+        else
+          range_key_value = optional_params.first
+          attrs, conditions = optional_params[1 .. 2]
+        end
+
+        options = if range_key
+                    { range_key: dump_field(range_key_value, attributes[range_key]) }
+                  else
+                    {}
+                  end
+
+        (conditions[:if_exists] ||= {})[hash_key] = hash_key_value
+        options[:conditions] = conditions
+
+        begin
+          new_attrs = Dynamoid.adapter.update_item(table_name, hash_key_value, options) do |t|
+            attrs.symbolize_keys.each do |k, v|
+              t.set k => dump_field(v, attributes[k])
+            end
+          end
+          new(new_attrs)
+        rescue Dynamoid::Errors::ConditionalCheckFailedException
+        end
+      end
+
+      def upsert(hash_key_value, range_key_value=nil, attrs={}, conditions={})
+        optional_params = [range_key_value, attrs, conditions].compact
+        if optional_params.first.is_a?(Hash)
+          range_key_value = nil
+          attrs, conditions = optional_params[0 .. 1]
+        else
+          range_key_value = optional_params.first
+          attrs, conditions = optional_params[1 .. 2]
+        end
+
+        options = if range_key
+                    { range_key: dump_field(range_key_value, attributes[range_key]) }
+                  else
+                    {}
+                  end
+
+        options[:conditions] = conditions
+
+        begin
+          new_attrs = Dynamoid.adapter.update_item(table_name, hash_key_value, options) do |t|
+            attrs.symbolize_keys.each do |k, v|
+              t.set k => dump_field(v, attributes[k])
+            end
+          end
+          new(new_attrs)
+        rescue Dynamoid::Errors::ConditionalCheckFailedException
+        end
+      end
+
+      def deep_subclasses
+        subclasses + subclasses.map(&:deep_subclasses).flatten
       end
     end
 
@@ -120,6 +203,10 @@ module Dynamoid #:nodoc:
     #
     # @since 0.2.0
     def initialize(attrs = {})
+      # we need this hack for Rails 4.0 only
+      # because `run_callbacks` calls `attributes` getter while it is still nil
+      @attributes = {}
+
       run_callbacks :initialize do
         @new_record = true
         @attributes ||= {}
@@ -163,7 +250,7 @@ module Dynamoid #:nodoc:
     # @since 0.2.0
     def reload
       range_key_value = range_value ? dumped_range_value : nil
-      self.attributes = self.class.find(hash_key, :range_key => range_key_value, :consistent_read => true).attributes
+      self.attributes = self.class.find(hash_key, range_key: range_key_value, consistent_read: true).attributes
       @associations.values.each(&:reset)
       self
     end

@@ -36,14 +36,26 @@ module Dynamoid
         ids = Array(ids.flatten.uniq)
         if ids.count == 1
           result = self.find_by_id(ids.first, options)
+          if result.nil?
+            message = "Couldn't find #{self.name} with '#{self.hash_key}'=#{ids[0]}"
+            raise Errors::RecordNotFound.new(message)
+          end
           expects_array ? Array(result) : result
         else
-          find_all(ids)
+          result = find_all(ids)
+          if result.size != ids.size
+            message = "Couldn't find all #{self.name.pluralize} with '#{self.hash_key}': (#{ids.join(', ')}) "
+            message << "(found #{result.size} results, but was looking for #{ids.size})"
+            raise Errors::RecordNotFound.new(message)
+          end
+          result
         end
       end
 
-      # Return objects found by the given array of ids, either hash keys, or hash/range key combinations using BatchGet.
+      # Return objects found by the given array of ids, either hash keys, or hash/range key combinations using BatchGetItem.
       # Returns empty array if no results found.
+      #
+      # Uses backoff specified by `Dynamoid::Config.backoff` config option
       #
       # @param [Array<ID>] ids
       # @param [Hash] options: Passed to the underlying query.
@@ -55,8 +67,26 @@ module Dynamoid
       #   find all the tweets using hash key and range key with consistent read
       #   Tweet.find_all([['1', 'red'], ['1', 'green']], :consistent_read => true)
       def find_all(ids, options = {})
-        items = Dynamoid.adapter.read(self.table_name, ids, options)
-        items ? items[self.table_name].map{|i| from_database(i)} : []
+        results = unless Dynamoid.config.backoff
+          items = Dynamoid.adapter.read(self.table_name, ids, options)
+          items ? items[self.table_name] : []
+        else
+          items = []
+          backoff = nil
+          Dynamoid.adapter.read(self.table_name, ids, options) do |hash, has_unprocessed_items|
+            items += hash[self.table_name]
+
+            if has_unprocessed_items
+              backoff ||= Dynamoid.config.build_backoff
+              backoff.call
+            else
+              backoff = nil
+            end
+          end
+          items
+        end
+
+        results ? results.map {|i| from_database(i) } : []
       end
 
       # Find one object directly by id.
@@ -81,7 +111,7 @@ module Dynamoid
       # @param [String/Number] range_key of the object to find
       #
       def find_by_composite_key(hash_key, range_key, options = {})
-        find_by_id(hash_key, options.merge({:range_key => range_key}))
+        find_by_id(hash_key, options.merge(range_key: range_key))
       end
 
       # Find all objects by hash and range keys.
@@ -106,7 +136,7 @@ module Dynamoid
       # @return [Array] an array of all matching items
       #
       def find_all_by_composite_key(hash_key, options = {})
-        Dynamoid.adapter.query(self.table_name, options.merge({hash_value: hash_key})).collect do |item|
+        Dynamoid.adapter.query(self.table_name, options.merge(hash_value: hash_key)).collect do |item|
           from_database(item)
         end
       end
@@ -121,14 +151,15 @@ module Dynamoid
       #     field :gender,         :string
       #     field :rank            :number
       #     table :key => :email
-      #     global_secondary_index :hash_key => :age, :range_key => :gender
+      #     global_secondary_index :hash_key => :age, :range_key => :rank
       #   end
-      #   User.find_all_by_secondary_index(:age => 5, :range => {"rank.lte" => 10})
+      #   # NOTE: the first param and the second param are both hashes,
+      #   #       so curly braces must be used on first hash param if sending both params
+      #   User.find_all_by_secondary_index({:age => 5}, :range => {"rank.lte" => 10})
       #
-      # @param [Hash] hash eg: {:age => 5}
-      # @param [Hash] options - @TODO support more options in future such as query filter, projected keys etc
-      # @option options [Hash] :range {"rank.lte" => 10}
-      # @option options [Boolean] :batch_size Fetch all records instead of limiting to 1MB
+      # @param [Hash] eg: {:age => 5}
+      # @param [Hash] eg: {"rank.lte" => 10}
+      # @param [Hash] options - query filter, projected keys, scan_index_forward etc
       # @return [Array] an array of all matching items
       def find_all_by_secondary_index(hash, options = {})
         range = options[:range] || {}
@@ -138,29 +169,29 @@ module Dynamoid
 
         if range_key_field
           range_key_field = range_key_field.to_s
-          range_key_op = "eq"
-          if range_key_field.include?(".")
-            range_key_field, range_key_op = range_key_field.split(".", 2)
+          range_key_op = 'eq'
+          if range_key_field.include?('.')
+            range_key_field, range_key_op = range_key_field.split('.', 2)
           end
           range_op_mapped = RANGE_MAP.fetch(range_key_op)
         end
 
         # Find the index
         index = self.find_index(hash_key_field, range_key_field)
-        raise Dynamoid::Errors::MissingIndex if index.nil?
+        raise Dynamoid::Errors::MissingIndex.new("attempted to find #{[hash_key_field, range_key_field]}") if index.nil?
 
         # query
         opts = {
-          :hash_key => hash_key_field.to_s,
-          :hash_value => hash_key_value,
-          :index_name => index.name,
+          hash_key: hash_key_field.to_s,
+          hash_value: hash_key_value,
+          index_name: index.name,
         }
-        opts[:batch_size] = options[:batch_size] if options[:batch_size]
         if range_key_field
           opts[:range_key] = range_key_field
           opts[range_op_mapped] = range_key_value
         end
-        Dynamoid.adapter.query(self.table_name, opts).map do |item|
+        dynamo_options = opts.merge(options.reject {|key, _| key == :range })
+        Dynamoid.adapter.query(self.table_name, dynamo_options).map do |item|
           from_database(item)
         end
       end
